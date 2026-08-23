@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildSendComponents } from './template-send-builder';
+import { buildSendComponents, renderTemplateBodyText } from './template-send-builder';
 import type { MessageTemplate } from '@/types';
 
 function row(overrides: Partial<MessageTemplate> = {}): MessageTemplate {
@@ -394,6 +394,40 @@ describe('buildSendComponents — NAMED header', () => {
         parameters: [{ type: 'text', parameter_name: 'customer_name', text: 'Sara' }],
       },
     ]);
+  });
+});
+
+describe('renderTemplateBodyText', () => {
+  it('substitutes NAMED {{name}} placeholders for local display/storage', () => {
+    const text = renderTemplateBodyText(
+      row({
+        parameter_format: 'NAMED',
+        body_text: 'Hi {{first_name}}, order {{order_number}} confirmed.',
+      }),
+      { body: { first_name: 'Rohit', order_number: '#8733' } },
+    );
+    expect(text).toBe('Hi Rohit, order #8733 confirmed.');
+  });
+
+  it('substitutes POSITIONAL {{N}} placeholders for local display/storage', () => {
+    const text = renderTemplateBodyText(
+      row({ body_text: 'Hi {{1}}, order {{2}} confirmed.' }),
+      { body: ['Rohit', '#8733'] },
+    );
+    expect(text).toBe('Hi Rohit, order #8733 confirmed.');
+  });
+
+  it('leaves an unresolved NAMED placeholder literal rather than throwing', () => {
+    const text = renderTemplateBodyText(
+      row({ parameter_format: 'NAMED', body_text: 'Hi {{first_name}}' }),
+      { body: {} },
+    );
+    expect(text).toBe('Hi {{first_name}}');
+  });
+
+  it('returns the body verbatim for a fully-static template', () => {
+    const text = renderTemplateBodyText(row({ body_text: 'No variables here.' }));
+    expect(text).toBe('No variables here.');
   });
 });
 

@@ -249,6 +249,7 @@
       "headerValuePlaceholder": "Value for the header variable",
       "bodyValuePlaceholder": "Value for {val}",
       "urlSuffixValuePlaceholder": "URL suffix value",
+      "buttonLinkValueLabel": "Button link value",
       "finalUrl": "Final URL: {url}",
       "back": "Back",
       "cancel": "Cancel",

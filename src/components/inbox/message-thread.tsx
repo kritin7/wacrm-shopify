@@ -47,22 +47,16 @@ import {
   type SendMediaPayload,
 } from "./message-composer";
 import { deleteAccountMedia } from "@/lib/storage/upload-media";
-import { TemplatePicker } from "./template-picker";
+import { TemplatePicker, type TemplateSendValues } from "./template-picker";
 import { AiThreadBanner } from "./ai-thread-banner";
 import { buildReplyPreview } from "./reply-quote";
+import { renderTemplateBodyText } from "@/lib/whatsapp/template-send-builder";
 import { toast } from "sonner";
 
 interface ReplyDraft {
   id: string;
   authorLabel: string;
   preview: string;
-}
-
-function renderTemplateBody(body: string, params: string[]): string {
-  return body.replace(/\{\{(\d+)\}\}/g, (_, raw) => {
-    const idx = Number(raw) - 1;
-    return params[idx] ?? `{{${raw}}}`;
-  });
 }
 
 interface MessageThreadProps {
@@ -641,17 +635,12 @@ export function MessageThread({
   }, []);
 
   const handleSendTemplate = useCallback(
-    async (
-      template: MessageTemplate,
-      values: {
-        body: string[];
-        headerText?: string;
-        buttonParams?: Record<number, string>;
-      },
-    ) => {
+    async (template: MessageTemplate, values: TemplateSendValues) => {
       if (!conversation) return;
 
-      const renderedBody = renderTemplateBody(template.body_text, values.body);
+      const renderedBody = renderTemplateBodyText(template, {
+        body: values.body,
+      });
       const tempId = `temp-${Date.now()}`;
 
       const optimisticMsg: Message = {
@@ -676,15 +665,20 @@ export function MessageThread({
             template_name: template.name,
             template_language: template.language,
             // Structured params drive the new send-builder path
-            // (header media + URL button substitution). Body values
-            // are mirrored under both shapes so the route can fall
-            // back if the template row isn't found locally.
+            // (header media + URL button substitution). `template_params`
+            // is the legacy string[]-only fallback the route falls back to
+            // if the template row isn't found locally — only meaningful
+            // (and only correctly shaped) for POSITIONAL bodies, so it's
+            // omitted for NAMED (Record<string, string>) rather than sent
+            // as a mis-shaped array.
             template_message_params: {
               body: values.body,
               headerText: values.headerText,
               buttonParams: values.buttonParams,
             },
-            template_params: values.body,
+            template_params: Array.isArray(values.body)
+              ? values.body
+              : undefined,
             content_text: renderedBody,
           }),
         });

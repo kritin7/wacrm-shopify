@@ -30,6 +30,10 @@ import {
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
 import {
+  renderTemplateBodyText,
+  type SendTimeParams,
+} from '@/lib/whatsapp/template-send-builder';
+import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
   type InteractiveMessagePayload,
@@ -448,13 +452,32 @@ export async function sendMessageToConversation(
   const interactiveBody =
     messageType === 'interactive' ? interactivePayload!.body : null;
 
+  // Template messages: callers (Shopify webhook, cron, automations, …)
+  // typically pass templateName + templateMessageParams and never a
+  // pre-rendered contentText — without this, content_text lands as
+  // NULL (blank bubble in the thread) and the conversation-list
+  // preview falls back to the literal "[template]" below. Render the
+  // same values that went into the Meta send (`renderTemplateBodyText`
+  // mirrors `buildBodyComponent`'s NAMED/POSITIONAL branch) so what's
+  // stored matches what the recipient actually got. An explicit
+  // caller-supplied `contentText` still wins — this only fills the gap
+  // when one wasn't given.
+  const templateBodyText =
+    messageType === 'template' && templateRow
+      ? renderTemplateBodyText(templateRow, {
+          body:
+            (templateMessageParams as SendTimeParams | undefined)?.body ??
+            templateParams,
+        })
+      : null;
+
   const { data: messageRecord, error: msgError } = await db
     .from('messages')
     .insert({
       conversation_id: conversationId,
       sender_type: 'agent',
       content_type: messageType,
-      content_text: interactiveBody ?? contentText ?? null,
+      content_text: interactiveBody ?? contentText ?? templateBodyText ?? null,
       media_url: mediaUrl || null,
       template_name: templateName || null,
       interactive_payload:
@@ -478,7 +501,7 @@ export async function sendMessageToConversation(
   const lastMessageText =
     messageType === 'interactive'
       ? interactivePayloadPreviewText(interactivePayload!)
-      : contentText || `[${messageType}]`;
+      : contentText || templateBodyText || `[${messageType}]`;
 
   await db
     .from('conversations')

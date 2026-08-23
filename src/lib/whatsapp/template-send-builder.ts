@@ -309,3 +309,43 @@ export function buildSendComponents(
   }
   return out;
 }
+
+/**
+ * Render the template's body into human-readable text for LOCAL
+ * display/storage (the `messages.content_text` bubble + the
+ * conversation-list preview) — sibling to `buildSendComponents`, NOT
+ * a replacement for it. Meta never sees this string; it gets its own
+ * `parameter_name`/positional `components` array from
+ * `buildBodyComponent`. This substitutes the same `params.body`
+ * values into `template.body_text` so the two stay in sync, branching
+ * on `parameter_format` the same way `buildBodyComponent` does.
+ *
+ * Deliberately non-throwing (unlike buildBodyComponent): by the time
+ * a caller has a successful Meta send to persist, `buildSendComponents`
+ * already validated the values are complete — this only runs after
+ * that succeeded. Any placeholder that still can't be resolved (a
+ * caller passing a bare `templateName` with no params, e.g.) is left
+ * in the text literally rather than throwing and losing the message
+ * that Meta already accepted.
+ */
+export function renderTemplateBodyText(
+  template: MessageTemplate,
+  params: SendTimeParams = {},
+): string {
+  const body = params.body;
+  if (template.parameter_format === 'NAMED') {
+    const values = Array.isArray(body) ? undefined : body;
+    return template.body_text.replace(
+      /\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g,
+      (match, name: string) => {
+        const value = values?.[name];
+        return value && value.trim() ? value : match;
+      },
+    );
+  }
+  const values = Array.isArray(body) ? body : undefined;
+  return template.body_text.replace(/\{\{(\d+)\}\}/g, (match, raw: string) => {
+    const value = values?.[Number(raw) - 1];
+    return value && String(value).trim() ? String(value) : match;
+  });
+}

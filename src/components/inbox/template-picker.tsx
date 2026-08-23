@@ -21,11 +21,22 @@ import {
   LayoutTemplate,
   Loader2,
 } from "lucide-react";
-import { extractVariableIndices } from "@/lib/whatsapp/template-validators";
+import {
+  extractVariableIndices,
+  extractNamedVariables,
+} from "@/lib/whatsapp/template-validators";
+import { renderTemplateBodyText } from "@/lib/whatsapp/template-send-builder";
 import { useTranslations } from "next-intl";
 
 export interface TemplateSendValues {
-  body: string[];
+  /**
+   * POSITIONAL templates → `string[]` indexed by {{N}}. NAMED
+   * templates → `Record<string, string>` keyed by {{name}}. Which
+   * shape a template expects is `template.parameter_format` — must
+   * match exactly what `template-send-builder.ts` expects, since the
+   * send route passes this straight through to `buildSendComponents`.
+   */
+  body: string[] | Record<string, string>;
   headerText?: string;
   buttonParams?: Record<number, string>;
 }
@@ -36,42 +47,95 @@ interface TemplatePickerProps {
   onSelect: (template: MessageTemplate, values: TemplateSendValues) => void;
 }
 
-function renderBodyPreview(body: string, params: string[]): string {
-  return body.replace(/\{\{(\d+)\}\}/g, (_, raw) => {
-    const idx = Number(raw) - 1;
-    const value = params[idx];
-    return value && value.trim().length > 0 ? value : `{{${raw}}}`;
-  });
-}
-
 interface UrlButtonSlot {
   index: number;
   text: string;
   url: string;
 }
 
-/**
- * Templates may need values for: body variables, a text-header
- * variable, and per-URL-button suffixes. Collect them all so the
- * send-message path doesn't 400 on missing parameters.
- */
-function collectVariableSlots(template: MessageTemplate): {
-  bodyVars: number[];
-  headerVarCount: number;
+interface NamedBodySlot {
+  name: string;
+  /** From `sample_values.body_text_named_params`, when synced. */
+  placeholder?: string;
+}
+
+interface TemplateSlots {
+  parameterFormat: "POSITIONAL" | "NAMED";
+  /** POSITIONAL body variable indices, e.g. [1, 2]. Empty for NAMED. */
+  bodyPositional: number[];
+  /** NAMED body variable names, in first-appearance order. Empty for POSITIONAL. */
+  bodyNamed: NamedBodySlot[];
+  headerKind: "none" | "positional" | "named";
+  /** Set only when headerKind === "named". */
+  headerNamedVar: string | null;
+  /**
+   * URL button {{1}} suffixes. Per Meta's spec these are always
+   * positional regardless of the body's parameter_format — abandoned_cart
+   * proved a NAMED-body template can still have a POSITIONAL {{1}} in a
+   * URL button — so this is detected independently of `parameterFormat`,
+   * mirroring `buildButtonComponent` in template-send-builder.ts.
+   */
   urlButtonSlots: UrlButtonSlot[];
-} {
-  const bodyVars = extractVariableIndices(template.body_text);
-  const headerVarCount =
-    template.header_type === "text" && template.header_content
-      ? extractVariableIndices(template.header_content).length
-      : 0;
+}
+
+/**
+ * Templates may need values for: body variables (positional or named),
+ * a text-header variable, and per-URL-button suffixes. Collect them
+ * all so the send-message path doesn't 400 on missing parameters.
+ *
+ * `template.parameter_format` (migration 039) is the source of truth
+ * for whether the body/header use {{N}} or {{name}} — not a regex
+ * re-inference over body_text.
+ */
+function collectVariableSlots(template: MessageTemplate): TemplateSlots {
+  const isNamed = template.parameter_format === "NAMED";
+
+  const bodyPositional = isNamed
+    ? []
+    : extractVariableIndices(template.body_text);
+
+  const namedExamples = new Map(
+    (template.sample_values?.body_text_named_params ?? []).map((p) => [
+      p.param_name,
+      p.example,
+    ]),
+  );
+  const bodyNamed: NamedBodySlot[] = isNamed
+    ? extractNamedVariables(template.body_text).map((name) => ({
+        name,
+        placeholder: namedExamples.get(name),
+      }))
+    : [];
+
+  let headerKind: TemplateSlots["headerKind"] = "none";
+  let headerNamedVar: string | null = null;
+  if (template.header_type === "text" && template.header_content) {
+    if (isNamed) {
+      const names = extractNamedVariables(template.header_content);
+      if (names.length > 0) {
+        headerKind = "named";
+        headerNamedVar = names[0];
+      }
+    } else if (extractVariableIndices(template.header_content).length > 0) {
+      headerKind = "positional";
+    }
+  }
+
   const urlButtonSlots: UrlButtonSlot[] = [];
   (template.buttons ?? []).forEach((b, i) => {
     if (b.type === "URL" && extractVariableIndices(b.url).length > 0) {
       urlButtonSlots.push({ index: i, text: b.text, url: b.url });
     }
   });
-  return { bodyVars, headerVarCount, urlButtonSlots };
+
+  return {
+    parameterFormat: isNamed ? "NAMED" : "POSITIONAL",
+    bodyPositional,
+    bodyNamed,
+    headerKind,
+    headerNamedVar,
+    urlButtonSlots,
+  };
 }
 
 export function TemplatePicker({
@@ -84,7 +148,8 @@ export function TemplatePicker({
   const [templates, setTemplates] = useState<MessageTemplate[]>([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<MessageTemplate | null>(null);
-  const [params, setParams] = useState<string[]>([]);
+  const [positionalParams, setPositionalParams] = useState<string[]>([]);
+  const [namedParams, setNamedParams] = useState<Record<string, string>>({});
   const [headerText, setHeaderText] = useState<string>("");
   const [buttonParams, setButtonParams] = useState<Record<number, string>>({});
 
@@ -134,7 +199,8 @@ export function TemplatePicker({
 
   function resetSelection() {
     setSelected(null);
-    setParams([]);
+    setPositionalParams([]);
+    setNamedParams({});
     setHeaderText("");
     setButtonParams({});
   }
@@ -147,23 +213,34 @@ export function TemplatePicker({
   function pickTemplate(template: MessageTemplate) {
     const slots = collectVariableSlots(template);
     const noInputsNeeded =
-      slots.bodyVars.length === 0 &&
-      slots.headerVarCount === 0 &&
+      slots.bodyPositional.length === 0 &&
+      slots.bodyNamed.length === 0 &&
+      slots.headerKind === "none" &&
       slots.urlButtonSlots.length === 0;
     if (noInputsNeeded) {
-      onSelect(template, { body: [] });
+      onSelect(template, {
+        body: slots.parameterFormat === "NAMED" ? {} : [],
+      });
       handleOpenChange(false);
       return;
     }
     setSelected(template);
-    setParams(new Array(slots.bodyVars.length).fill(""));
+    setPositionalParams(new Array(slots.bodyPositional.length).fill(""));
+    setNamedParams({});
     setHeaderText("");
     setButtonParams({});
   }
 
+  const slots = useMemo(
+    () => (selected ? collectVariableSlots(selected) : null),
+    [selected],
+  );
+
   function confirm() {
-    if (!selected) return;
-    const values: TemplateSendValues = { body: params };
+    if (!selected || !slots) return;
+    const values: TemplateSendValues = {
+      body: slots.parameterFormat === "NAMED" ? namedParams : positionalParams,
+    };
     if (headerText.trim()) values.headerText = headerText.trim();
     if (Object.keys(buttonParams).length > 0) {
       values.buttonParams = Object.fromEntries(
@@ -174,15 +251,24 @@ export function TemplatePicker({
     handleOpenChange(false);
   }
 
-  const slots = useMemo(
-    () => (selected ? collectVariableSlots(selected) : null),
-    [selected],
-  );
+  const previewBody = useMemo(() => {
+    if (!selected) return "";
+    const body =
+      slots?.parameterFormat === "NAMED" ? namedParams : positionalParams;
+    return renderTemplateBodyText(selected, { body });
+  }, [selected, slots, namedParams, positionalParams]);
+
   const canConfirm =
     !!selected &&
     !!slots &&
-    slots.bodyVars.every((_, i) => (params[i] ?? "").trim().length > 0) &&
-    (slots.headerVarCount === 0 || headerText.trim().length > 0) &&
+    (slots.parameterFormat === "NAMED"
+      ? slots.bodyNamed.every(
+          (s) => (namedParams[s.name] ?? "").trim().length > 0,
+        )
+      : slots.bodyPositional.every(
+          (_, i) => (positionalParams[i] ?? "").trim().length > 0,
+        )) &&
+    (slots.headerKind === "none" || headerText.trim().length > 0) &&
     slots.urlButtonSlots.every(
       (s) => (buttonParams[s.index] ?? "").trim().length > 0,
     );
@@ -216,30 +302,30 @@ export function TemplatePicker({
                 </p>
               </div>
             ) : (
-              templates.map((t) => (
+              templates.map((tpl) => (
                 <button
-                  key={t.id}
+                  key={tpl.id}
                   type="button"
-                  onClick={() => pickTemplate(t)}
+                  onClick={() => pickTemplate(tpl)}
                   className="w-full rounded-md border border-border bg-background/50 p-3 text-left transition-colors hover:border-primary/40 hover:bg-popover"
                 >
                   <div className="flex items-start gap-2">
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
                         <p className="truncate text-sm font-medium text-popover-foreground">
-                          {t.name}
+                          {tpl.name}
                         </p>
                         <Badge className="border border-primary/30 bg-primary/20 text-[10px] text-primary">
-                          {t.category}
+                          {tpl.category}
                         </Badge>
-                        {t.language && (
+                        {tpl.language && (
                           <span className="text-[10px] uppercase text-muted-foreground">
-                            {t.language}
+                            {tpl.language}
                           </span>
                         )}
                       </div>
                       <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
-                        {t.body_text}
+                        {tpl.body_text}
                       </p>
                     </div>
                     <ChevronRight className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
@@ -253,7 +339,7 @@ export function TemplatePicker({
             <div className="rounded-md border border-border bg-background/50 p-3">
               <p className="mb-1 text-xs text-muted-foreground">{t("preview")}</p>
               <p className="whitespace-pre-wrap text-sm text-popover-foreground">
-                {renderBodyPreview(selected.body_text, params)}
+                {previewBody}
               </p>
               {selected.footer_text && (
                 <p className="mt-2 text-xs italic text-muted-foreground">
@@ -261,10 +347,12 @@ export function TemplatePicker({
                 </p>
               )}
             </div>
-            {slots && slots.headerVarCount > 0 && (
+            {slots?.headerKind !== "none" && (
               <div className="space-y-1">
                 <Label className="text-xs text-popover-foreground">
-                  {`Header {{1}}`}
+                  {slots?.headerKind === "named"
+                    ? slots.headerNamedVar
+                    : `Header {{1}}`}
                 </Label>
                 <Input
                   value={headerText}
@@ -274,25 +362,47 @@ export function TemplatePicker({
                 />
               </div>
             )}
-            {slots?.bodyVars.map((v, i) => (
-              <div key={v} className="space-y-1">
-                <Label className="text-xs text-popover-foreground">{`Body {{${v}}}`}</Label>
-                <Input
-                  value={params[i] ?? ""}
-                  onChange={(e) => {
-                    const next = [...params];
-                    next[i] = e.target.value;
-                    setParams(next);
-                  }}
-                  placeholder={t("bodyValuePlaceholder", { val: `{{${v}}}` })}
-                  className="border-border bg-muted text-foreground placeholder:text-muted-foreground"
-                />
-              </div>
-            ))}
+            {slots?.parameterFormat === "POSITIONAL"
+              ? slots.bodyPositional.map((v, i) => (
+                  <div key={v} className="space-y-1">
+                    <Label className="text-xs text-popover-foreground">{`Body {{${v}}}`}</Label>
+                    <Input
+                      value={positionalParams[i] ?? ""}
+                      onChange={(e) => {
+                        const next = [...positionalParams];
+                        next[i] = e.target.value;
+                        setPositionalParams(next);
+                      }}
+                      placeholder={t("bodyValuePlaceholder", { val: `{{${v}}}` })}
+                      className="border-border bg-muted text-foreground placeholder:text-muted-foreground"
+                    />
+                  </div>
+                ))
+              : slots?.bodyNamed.map((slot) => (
+                  <div key={slot.name} className="space-y-1">
+                    <Label className="text-xs text-popover-foreground">
+                      {slot.name}
+                    </Label>
+                    <Input
+                      value={namedParams[slot.name] ?? ""}
+                      onChange={(e) =>
+                        setNamedParams((prev) => ({
+                          ...prev,
+                          [slot.name]: e.target.value,
+                        }))
+                      }
+                      placeholder={
+                        slot.placeholder ||
+                        t("bodyValuePlaceholder", { val: slot.name })
+                      }
+                      className="border-border bg-muted text-foreground placeholder:text-muted-foreground"
+                    />
+                  </div>
+                ))}
             {slots?.urlButtonSlots.map((slot) => (
               <div key={slot.index} className="space-y-1">
                 <Label className="text-xs text-popover-foreground">
-                  {`URL button "${slot.text}" — value for `}{`{{1}}`}
+                  {`${t("buttonLinkValueLabel")} — "${slot.text}"`}
                 </Label>
                 <Input
                   value={buttonParams[slot.index] ?? ""}

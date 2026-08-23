@@ -346,7 +346,10 @@ export function ContactDetailView({
             headerText: values.headerText,
             buttonParams: values.buttonParams,
           },
-          template_params: values.body,
+          // Legacy string[]-only fallback the route falls back to if the
+          // template row isn't found locally — only valid for POSITIONAL
+          // bodies, so omitted (not mis-shaped) for NAMED.
+          template_params: Array.isArray(values.body) ? values.body : undefined,
         }),
       });
 

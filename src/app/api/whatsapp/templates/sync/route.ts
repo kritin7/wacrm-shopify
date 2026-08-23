@@ -37,6 +37,10 @@ interface MetaTemplateComponent {
     header_text?: string[]
     header_handle?: string[]
     body_text?: string[][]
+    // NAMED-format templates carry their body examples here instead
+    // of `body_text` — one {param_name, example} pair per {{name}}
+    // variable. POSITIONAL templates never populate this.
+    body_text_named_params?: { param_name: string; example: string }[]
   }
 }
 
@@ -119,12 +123,19 @@ function extractSampleValues(
   header: MetaTemplateComponent | undefined,
 ): TemplateSampleValues | null {
   // Meta returns body_text as a 2D array — one row per example set.
-  // We take the first row (most templates have exactly one).
+  // We take the first row (most templates have exactly one). NAMED
+  // templates use a different shape entirely (body_text_named_params,
+  // keyed by name rather than position) — captured separately so the
+  // send-template UI can source per-variable placeholders from it.
   const bodySample = body?.example?.body_text?.[0]
+  const namedBodySample = body?.example?.body_text_named_params
   const headerSample = header?.example?.header_text
-  if (!bodySample?.length && !headerSample?.length) return null
+  if (!bodySample?.length && !namedBodySample?.length && !headerSample?.length) {
+    return null
+  }
   const sv: TemplateSampleValues = {}
   if (bodySample?.length) sv.body = bodySample
+  if (namedBodySample?.length) sv.body_text_named_params = namedBodySample
   if (headerSample?.length) sv.header = headerSample
   return sv
 }

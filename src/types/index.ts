@@ -310,6 +310,14 @@ export type TemplateButton =
 export interface TemplateSampleValues {
   body?: string[];
   header?: string[];
+  /**
+   * NAMED-format body examples, exactly as Meta returns them under
+   * `components[BODY].example.body_text_named_params` — one entry per
+   * `{{name}}` variable, keyed by name rather than position. Only
+   * populated for `parameter_format === 'NAMED'` templates; POSITIONAL
+   * templates carry their examples in `body` instead.
+   */
+  body_text_named_params?: { param_name: string; example: string }[];
 }
 
 // Meta's two variable-substitution conventions. POSITIONAL uses {{1}},

@@ -249,6 +249,7 @@
       "headerValuePlaceholder": "헤더 변수 값",
       "bodyValuePlaceholder": "{val}의 값",
       "urlSuffixValuePlaceholder": "URL 접미사 값",
+      "buttonLinkValueLabel": "버튼 링크 값",
       "finalUrl": "최종 URL: {url}",
       "back": "뒤로",
       "cancel": "취소",
