@@ -60,6 +60,9 @@ export function validateTemplateName(name: string): void {
 /**
  * Extract sorted, deduplicated {{N}} indices from a string. Returns
  * `[1, 2, 4]` for `"Hi {{1}} {{2}}, item {{4}}"`.
+ *
+ * POSITIONAL-format templates only — see `extractNamedVariables` for
+ * the NAMED-format counterpart ({{first_name}}, not {{1}}).
  */
 export function extractVariableIndices(text: string): number[] {
   const matches = text.matchAll(/\{\{(\d+)\}\}/g);
@@ -69,6 +72,32 @@ export function extractVariableIndices(text: string): number[] {
     if (Number.isFinite(n) && n >= 1) set.add(n);
   }
   return [...set].sort((a, b) => a - b);
+}
+
+/**
+ * Extract ordered, deduplicated {{name}} parameter names from a
+ * NAMED-format string. Returns `['first_name', 'order_number']` for
+ * `"Hi {{first_name}}, order {{order_number}}"`. Order is
+ * first-appearance order (NAMED params are matched by name, not
+ * position, but callers building a value-collection UI still want a
+ * stable order to render in).
+ *
+ * Meta's NAMED variable names are identifiers: letters, digits,
+ * underscore, not starting with a digit — that's exactly what
+ * distinguishes them from POSITIONAL's `{{\d+}}`.
+ */
+export function extractNamedVariables(text: string): string[] {
+  const matches = text.matchAll(/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const m of matches) {
+    const name = m[1];
+    if (!seen.has(name)) {
+      seen.add(name);
+      out.push(name);
+    }
+  }
+  return out;
 }
 
 /**

@@ -255,6 +255,148 @@ describe('buildSendComponents — buttons', () => {
   });
 });
 
+describe('buildSendComponents — NAMED body', () => {
+  it('emits parameter_name-keyed params for a NAMED template', () => {
+    const components = buildSendComponents(
+      row({
+        parameter_format: 'NAMED',
+        body_text: 'Hi {{first_name}}, order {{order_number}} confirmed.',
+      }),
+      { body: { first_name: 'Rohit', order_number: '#8733' } },
+    );
+    expect(components).toEqual([
+      {
+        type: 'body',
+        parameters: [
+          { type: 'text', parameter_name: 'first_name', text: 'Rohit' },
+          { type: 'text', parameter_name: 'order_number', text: '#8733' },
+        ],
+      },
+    ]);
+  });
+
+  it('orders named params by first-appearance in the body text, not object key order', () => {
+    const components = buildSendComponents(
+      row({
+        parameter_format: 'NAMED',
+        body_text: 'Save {{saving_amount}}, hi {{first_name}}',
+      }),
+      { body: { first_name: 'Rohit', saving_amount: '129' } },
+    );
+    expect(components).toEqual([
+      {
+        type: 'body',
+        parameters: [
+          { type: 'text', parameter_name: 'saving_amount', text: '129' },
+          { type: 'text', parameter_name: 'first_name', text: 'Rohit' },
+        ],
+      },
+    ]);
+  });
+
+  it('throws when a NAMED template is sent an array body', () => {
+    expect(() =>
+      buildSendComponents(
+        row({ parameter_format: 'NAMED', body_text: 'Hi {{first_name}}' }),
+        { body: ['Rohit'] },
+      ),
+    ).toThrow(/uses NAMED parameters — pass body as \{ first_name \}/);
+  });
+
+  it('throws when a NAMED template is missing a value', () => {
+    expect(() =>
+      buildSendComponents(
+        row({
+          parameter_format: 'NAMED',
+          body_text: 'Hi {{first_name}}, order {{order_number}}',
+        }),
+        { body: { first_name: 'Rohit' } },
+      ),
+    ).toThrow(/missing value\(s\) for named parameter\(s\): \{\{order_number\}\}/);
+  });
+
+  it('throws when a POSITIONAL template is sent a named object body', () => {
+    expect(() =>
+      buildSendComponents(
+        row({ body_text: 'Hi {{1}}' }),
+        { body: { first_name: 'Rohit' } as unknown as string[] },
+      ),
+    ).toThrow(/uses POSITIONAL parameters — pass body as a string\[\]/);
+  });
+
+  it('matches abandoned_cart\'s shape: NAMED body + a POSITIONAL {{1}} URL-button suffix', () => {
+    const components = buildSendComponents(
+      row({
+        name: 'abandoned_cart',
+        parameter_format: 'NAMED',
+        header_type: 'image',
+        header_media_url: 'https://x.com/cart.png',
+        body_text: 'Hi {{first_name}}, complete your order.',
+        buttons: [
+          {
+            type: 'URL',
+            text: 'Complete your Purchase',
+            url: 'https://shop.example.com/cart?magic_order_id=order_{{1}}',
+          },
+        ],
+      }),
+      {
+        body: { first_name: 'Rohit' },
+        buttonParams: { 0: 'TGqOZSZmUMFBZT' },
+      },
+    );
+    expect(components).toEqual([
+      {
+        type: 'header',
+        parameters: [{ type: 'image', image: { link: 'https://x.com/cart.png' } }],
+      },
+      {
+        type: 'body',
+        parameters: [{ type: 'text', parameter_name: 'first_name', text: 'Rohit' }],
+      },
+      {
+        type: 'button',
+        sub_type: 'url',
+        index: '0',
+        parameters: [{ type: 'text', text: 'TGqOZSZmUMFBZT' }],
+      },
+    ]);
+  });
+});
+
+describe('buildSendComponents — NAMED header', () => {
+  it('skips static TEXT headers even when parameter_format is NAMED', () => {
+    expect(
+      buildSendComponents(
+        row({
+          parameter_format: 'NAMED',
+          header_type: 'text',
+          header_content: 'Delivered!',
+          body_text: 'Hi {{first_name}}',
+        }),
+        { body: { first_name: 'Rohit' } },
+      ).filter((c) => c.type === 'header'),
+    ).toEqual([]);
+  });
+
+  it('emits a parameter_name-keyed header param when a NAMED TEXT header has a variable', () => {
+    const components = buildSendComponents(
+      row({
+        parameter_format: 'NAMED',
+        header_type: 'text',
+        header_content: 'Hello {{customer_name}}',
+      }),
+      { headerText: 'Sara' },
+    );
+    expect(components).toEqual([
+      {
+        type: 'header',
+        parameters: [{ type: 'text', parameter_name: 'customer_name', text: 'Sara' }],
+      },
+    ]);
+  });
+});
+
 describe('buildSendComponents — end-to-end mix', () => {
   it('orders components header → body → buttons and includes all', () => {
     const components = buildSendComponents(

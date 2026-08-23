@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  extractNamedVariables,
   extractVariableIndices,
   TEMPLATE_LIMITS,
   validateBody,
@@ -25,6 +26,25 @@ describe('extractVariableIndices', () => {
   });
   it('returns empty array for no variables', () => {
     expect(extractVariableIndices('No vars here')).toEqual([]);
+  });
+  it('does not match NAMED {{name}} placeholders', () => {
+    expect(extractVariableIndices('Hi {{first_name}}')).toEqual([]);
+  });
+});
+
+describe('extractNamedVariables', () => {
+  it('returns deduplicated names in first-appearance order', () => {
+    expect(
+      extractNamedVariables(
+        'Save {{saving_amount}}, hi {{first_name}}, pay {{cod_amount}}, save {{saving_amount}} again',
+      ),
+    ).toEqual(['saving_amount', 'first_name', 'cod_amount']);
+  });
+  it('returns empty array for no variables', () => {
+    expect(extractNamedVariables('No vars here')).toEqual([]);
+  });
+  it('does not match POSITIONAL {{N}} placeholders', () => {
+    expect(extractNamedVariables('Hi {{1}} {{2}}')).toEqual([]);
   });
 });
 

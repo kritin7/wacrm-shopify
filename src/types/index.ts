@@ -312,12 +312,22 @@ export interface TemplateSampleValues {
   header?: string[];
 }
 
+// Meta's two variable-substitution conventions. POSITIONAL uses {{1}},
+// {{2}}, … filled in array order; NAMED uses {{snake_case_name}} filled
+// in by name — order-independent, and the send payload must carry
+// `parameter_name` on each body/header text parameter. Absent on rows
+// synced before this column existed — treat missing as POSITIONAL,
+// which is what those rows actually are (Meta defaulted to it before
+// NAMED existed).
+export type TemplateParameterFormat = 'POSITIONAL' | 'NAMED';
+
 export interface MessageTemplate {
   id: string;
   user_id: string;
   name: string;
   category: 'Marketing' | 'Utility' | 'Authentication';
   language?: string;
+  parameter_format?: TemplateParameterFormat;
   header_type?: 'text' | 'image' | 'video' | 'document';
   header_content?: string;
   header_handle?: string;

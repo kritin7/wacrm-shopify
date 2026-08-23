@@ -46,8 +46,15 @@ interface MetaTemplate {
   language: string
   status: string
   category: string
+  parameter_format?: string
   components?: MetaTemplateComponent[]
   quality_score?: { score?: string } | string
+}
+
+function normalizeParameterFormat(
+  raw: string | undefined,
+): 'POSITIONAL' | 'NAMED' {
+  return raw?.toUpperCase() === 'NAMED' ? 'NAMED' : 'POSITIONAL'
 }
 
 function normalizeCategory(
@@ -181,7 +188,7 @@ export async function POST() {
     const metaTemplates: MetaTemplate[] = []
     let nextUrl:
       | string
-      | null = `${META_API_BASE}/${config.waba_id}/message_templates?limit=100&fields=id,name,language,status,category,components,quality_score`
+      | null = `${META_API_BASE}/${config.waba_id}/message_templates?limit=100&fields=id,name,language,status,category,parameter_format,components,quality_score`
     const PAGE_CAP = 20
     let pageCount = 0
 
@@ -241,6 +248,7 @@ export async function POST() {
         name: t.name,
         category: normalizeCategory(t.category),
         language: t.language,
+        parameter_format: normalizeParameterFormat(t.parameter_format),
         header_type: headerType,
         header_content: header?.text ?? null,
         header_handle: header?.example?.header_handle?.[0] ?? null,

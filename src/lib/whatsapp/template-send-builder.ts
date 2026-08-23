@@ -15,8 +15,10 @@
  *     using the template's `header_media_url` (or `header_handle`).
  *     Meta requires the media component on every send even though
  *     the URL hasn't changed since approval.
- *   - TEXT headers with `{{1}}` need `headerText` from the caller.
- *   - Body variables come in as `body: string[]`, indexed by {{N}}.
+ *   - TEXT headers with a variable need `headerText` from the caller.
+ *   - Body variables come in as `body`, either `string[]` indexed by
+ *     {{N}} (POSITIONAL templates) or `Record<string, string>` keyed
+ *     by name (NAMED templates) — see `template.parameter_format`.
  *   - URL buttons with `{{1}}` need `buttonUrlParams[i]` keyed by
  *     button index. URL buttons without variables, plus QUICK_REPLY
  *     and PHONE_NUMBER buttons, don't need send-time parameters.
@@ -31,12 +33,23 @@
  */
 
 import type { MessageTemplate, TemplateButton } from '@/types';
-import { extractVariableIndices } from './template-validators';
+import { extractVariableIndices, extractNamedVariables } from './template-validators';
 
 export interface SendTimeParams {
-  /** Values for body {{1}}, {{2}}, … indexed by variable position. */
-  body?: string[];
-  /** Value for TEXT-header {{1}}, when the header has a variable. */
+  /**
+   * Body variable values.
+   *
+   * POSITIONAL templates ({{1}}, {{2}}, …) — pass `string[]`, indexed
+   * by variable position.
+   *
+   * NAMED templates ({{first_name}}, {{order_number}}, …) — pass
+   * `Record<string, string>` keyed by the variable's name, e.g.
+   * `{ first_name: "Rohit", order_number: "#8733" }`. Which shape a
+   * template expects is `template.parameter_format` — passing the
+   * wrong shape throws rather than silently sending the wrong values.
+   */
+  body?: string[] | Record<string, string>;
+  /** Value for TEXT-header {{1}} (or {{name}} for NAMED), when the header has a variable. */
   headerText?: string;
   /** Override the template's static media URL for this send. */
   headerMediaUrl?: string;
@@ -62,7 +75,7 @@ export type MetaSendComponent =
     };
 
 type MetaSendParameter =
-  | { type: 'text'; text: string }
+  | { type: 'text'; text: string; parameter_name?: string }
   | { type: 'image'; image: { link?: string; id?: string } }
   | { type: 'video'; video: { link?: string; id?: string } }
   | { type: 'document'; document: { link?: string; id?: string } }
@@ -77,20 +90,30 @@ function buildHeaderComponent(
   if (!headerType) return null;
 
   if (headerType === 'text') {
-    // TEXT header with {{1}} → need a value. Static text headers
+    // TEXT header with a variable → need a value. Static text headers
     // (no variables) just ride along inside the template itself; no
-    // header component required on send.
-    const varCount = extractVariableIndices(template.header_content ?? '').length;
+    // header component required on send — true for both parameter
+    // formats since "has a variable" is what gates this, not the format.
+    const headerContent = template.header_content ?? '';
+    const isNamed = template.parameter_format === 'NAMED';
+    const namedVars = isNamed ? extractNamedVariables(headerContent) : [];
+    const varCount = isNamed
+      ? namedVars.length
+      : extractVariableIndices(headerContent).length;
     if (varCount === 0) return null;
     const value = params.headerText;
     if (!value || !value.trim()) {
+      const placeholder = isNamed ? `{{${namedVars[0]}}}` : '{{1}}';
       throw new Error(
-        'Header text variable {{1}} requires a value — pass headerText.',
+        `Header text variable ${placeholder} requires a value — pass headerText.`,
       );
     }
+    const textParam: MetaSendParameter = isNamed
+      ? { type: 'text', text: value, parameter_name: namedVars[0] }
+      : { type: 'text', text: value };
     return {
       type: 'header',
-      parameters: [{ type: 'text', text: value }],
+      parameters: [textParam],
     };
   }
 
@@ -127,20 +150,67 @@ function buildBodyComponent(
   template: MessageTemplate,
   params: SendTimeParams,
 ): MetaSendComponent | null {
+  return template.parameter_format === 'NAMED'
+    ? buildNamedBodyComponent(template, params)
+    : buildPositionalBodyComponent(template, params);
+}
+
+function buildPositionalBodyComponent(
+  template: MessageTemplate,
+  params: SendTimeParams,
+): MetaSendComponent | null {
   const varCount = extractVariableIndices(template.body_text).length;
-  const body = params.body ?? [];
-  if (varCount === 0 && body.length === 0) return null;
-  if (body.length < varCount) {
+  const body = params.body;
+  if (body !== undefined && !Array.isArray(body)) {
     throw new Error(
-      `Body has ${varCount} variable(s) but only ${body.length} value(s) were supplied.`,
+      `Template "${template.name}" uses POSITIONAL parameters — pass body as a string[], not an object.`,
+    );
+  }
+  const values = body ?? [];
+  if (varCount === 0 && values.length === 0) return null;
+  if (values.length < varCount) {
+    throw new Error(
+      `Body has ${varCount} variable(s) but only ${values.length} value(s) were supplied.`,
     );
   }
   // Trim to the variable count — extra values are dropped silently so
   // a legacy caller that passes too many doesn't error out.
-  const values = body.slice(0, varCount);
+  const trimmed = values.slice(0, varCount);
   return {
     type: 'body',
-    parameters: values.map((text) => ({ type: 'text', text: String(text) })),
+    parameters: trimmed.map((text) => ({ type: 'text', text: String(text) })),
+  };
+}
+
+function buildNamedBodyComponent(
+  template: MessageTemplate,
+  params: SendTimeParams,
+): MetaSendComponent | null {
+  const names = extractNamedVariables(template.body_text);
+  const body = params.body;
+  if (names.length === 0) return null;
+  if (Array.isArray(body)) {
+    throw new Error(
+      `Template "${template.name}" uses NAMED parameters — pass body as ` +
+        `{ ${names.join(', ')} }, not an array.`,
+    );
+  }
+  const values = body ?? {};
+  const missing = names.filter((name) => !values[name]?.trim());
+  if (missing.length > 0) {
+    throw new Error(
+      `Body is missing value(s) for named parameter(s): ${missing
+        .map((n) => `{{${n}}}`)
+        .join(', ')}.`,
+    );
+  }
+  return {
+    type: 'body',
+    parameters: names.map((name) => ({
+      type: 'text',
+      parameter_name: name,
+      text: String(values[name]),
+    })),
   };
 }
 
@@ -150,6 +220,11 @@ function buttonNeedsSendParam(
 ): boolean {
   switch (button.type) {
     case 'URL':
+      // URL button dynamic suffixes are always positional ({{1}}) per
+      // Meta's spec — even on a NAMED-format template (e.g.
+      // abandoned_cart: NAMED body, but its URL button dynamic suffix
+      // is still {{1}}). Checked against the button's own `url`
+      // string, independent of `template.parameter_format`.
       return extractVariableIndices(button.url).length > 0;
     case 'COPY_CODE':
       // We always emit a button param for COPY_CODE so the customer
