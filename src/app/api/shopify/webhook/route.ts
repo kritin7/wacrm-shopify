@@ -121,6 +121,8 @@ interface ShopifyOrderPayload {
   /** Shopify sets one or both when the order originated from a checkout. */
   checkout_token?: string | null
   cart_token?: string | null
+  /** Decimal string, e.g. "698.00" — feeds cod_order_amount / prepaid_order_amount. */
+  total_price?: string | null
 }
 
 interface ShopifyRefundPayload {
@@ -154,7 +156,15 @@ interface Recipient {
 interface TemplateSend {
   templateName: string
   language: string
-  body: string[]
+  /**
+   * All five directly-sent templates (order_placed_prepaid,
+   * order_placed_cod, order_cancelled, shipped, order_delivered) are
+   * `parameter_format: NAMED` in Meta — body values MUST be a named
+   * object keyed by the template's actual {{param}} names, not a
+   * positional array. See the per-handler call sites below for the
+   * confirmed key set per template.
+   */
+  body: Record<string, string>
 }
 
 // ------------------------------------------------------------
@@ -286,11 +296,16 @@ async function handleOrderCreate(
   const isPrepaid = guessIsPrepaid(order)
   const orderNumber = order.name ?? String(order.id)
   const firstName = recipient.contactName?.split(' ')[0] || 'there'
+  const amount = formatOrderAmount(order.total_price)
 
+  // order_placed_prepaid: { first_name, order_number, prepaid_order_amount }
+  // order_placed_cod:     { first_name, order_number, cod_order_amount }
   await sendTemplateAndMark(db, accountId, webhookId, recipient, {
     templateName: isPrepaid ? 'order_placed_prepaid' : 'order_placed_cod',
     language: LANGUAGE,
-    body: [firstName, orderNumber], // TODO: confirm {{1}}/{{2}}/… order per template.
+    body: isPrepaid
+      ? { first_name: firstName, order_number: orderNumber, prepaid_order_amount: amount }
+      : { first_name: firstName, order_number: orderNumber, cod_order_amount: amount },
   })
 
   // The cart converted — cancel any pending abandoned_cart reminder
@@ -322,7 +337,15 @@ async function handleOrderCreate(
         contact_name: recipient.contactName,
         template_name: 'cod_followup',
         language: LANGUAGE,
-        body: [firstName, orderNumber], // TODO: confirm.
+        // ⚠️ STILL BROKEN — left as a positional array on purpose.
+        // cod_followup is NAMED and needs { saving_amount, first_name,
+        // cod_amount, prepaid_amount, saving_amount1, prepaid_amount1 }
+        // — a prepaid-discount amount/rate this webhook has no source
+        // for (Shopify's order payload carries no such field; it's a
+        // merchant-defined discount rule). This array WILL throw
+        // "uses NAMED parameters" when the cron drains it — needs a
+        // discount source wired before cod_followup can send at all.
+        body: [firstName, orderNumber],
         run_at: new Date(Date.now() + COD_FOLLOWUP_DELAY_MS).toISOString(),
       })
       if (error && !isUniqueViolation(error)) {
@@ -341,10 +364,11 @@ async function handleOrderCancelled(
   const recipient = extractOrderRecipient(order)
   const orderNumber = order.name ?? String(order.id)
   const firstName = recipient.contactName?.split(' ')[0] || 'there'
+  // order_cancelled: { first_name, order_number }
   await sendTemplateAndMark(db, accountId, webhookId, recipient, {
     templateName: 'order_cancelled',
     language: LANGUAGE,
-    body: [firstName, orderNumber], // TODO: confirm.
+    body: { first_name: firstName, order_number: orderNumber },
   })
 }
 
@@ -374,10 +398,19 @@ async function handleFulfillmentCreate(
 ): Promise<void> {
   const recipient = extractFulfillmentRecipient(fulfillment)
   const firstName = recipient.contactName?.split(' ')[0] || 'there'
+  // shipped: { first_name, order_number, tracking_id }
+  // TODO: order_number falls back to the numeric order_id — the
+  // fulfillment webhook payload doesn't carry the order's display
+  // name (e.g. "#3432"), only order_id. Wire an order_id→name lookup
+  // if the exact display format matters.
   await sendTemplateAndMark(db, accountId, webhookId, recipient, {
     templateName: 'shipped',
     language: LANGUAGE,
-    body: [firstName, fulfillment.tracking_number ?? ''], // TODO: confirm.
+    body: {
+      first_name: firstName,
+      order_number: String(fulfillment.order_id),
+      tracking_id: fulfillment.tracking_number ?? '',
+    },
   })
 
   // The order started shipping — cancel any pending cod_followup nudge.
@@ -402,10 +435,11 @@ async function handleFulfillmentUpdate(
   const firstName = recipient.contactName?.split(' ')[0] || 'there'
 
   if (fulfillment.shipment_status === 'delivered') {
+    // order_delivered: { first_name }
     await sendTemplateAndMark(db, accountId, webhookId, recipient, {
       templateName: 'order_delivered',
       language: LANGUAGE,
-      body: [firstName], // TODO: confirm.
+      body: { first_name: firstName },
     })
     return
   }
@@ -469,7 +503,10 @@ async function handleCheckoutCreate(
     contact_name: contactName,
     template_name: 'abandoned_cart',
     language: LANGUAGE,
-    body: [firstName], // TODO: confirm — e.g. cart items / a recovery link.
+    // abandoned_cart: { first_name } — NAMED. The button's own {{1}}
+    // dynamic suffix (magic_order_id) is positional and separate from
+    // this body object — not wired here yet; see the cron route.
+    body: { first_name: firstName },
     run_at: runAt.toISOString(),
   })
 
@@ -578,6 +615,17 @@ function guessIsPrepaid(order: ShopifyOrderPayload): boolean {
   // Default to prepaid when ambiguous — TODO: confirm this is the
   // right fallback direction for your store's gateway setup.
   return order.financial_status !== 'pending'
+}
+
+/**
+ * Shopify's `total_price` is a decimal string like "698.00". The
+ * templates' sample values show whole-rupee amounts ("698", no
+ * decimals) — strip a trailing ".00" so the sent message matches.
+ * Amounts with real cents (e.g. "698.50") are left as-is.
+ */
+function formatOrderAmount(totalPrice: string | null | undefined): string {
+  if (!totalPrice) return ''
+  return totalPrice.replace(/\.00$/, '')
 }
 
 // ------------------------------------------------------------

@@ -76,7 +76,13 @@ export async function GET(request: Request) {
         messageType: 'template',
         templateName: row.template_name as string,
         templateLanguage: (row.language as string | null) ?? 'en',
-        templateMessageParams: { body: (row.body as string[]) ?? [] },
+        // `body` is stored as whatever shape the scheduling webhook
+        // wrote — a named object for NAMED templates (abandoned_cart),
+        // still a positional array for cod_followup until its discount
+        // fields are wired (see the webhook route's TODO on that insert).
+        templateMessageParams: {
+          body: (row.body as string[] | Record<string, string>) ?? [],
+        },
       })
       await db
         .from('shopify_scheduled_notifications')
