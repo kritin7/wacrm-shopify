@@ -4,11 +4,27 @@
 //
 // A second, independent abandoned-cart source alongside Shopify's
 // (`/api/shopify/webhook`'s checkouts/create path) — different
-// provider, different payload shape, different signature scheme.
-// Deliberately NOT wired into shopify_stores / shopify_webhook_events
-// / shopify_scheduled_notifications — separate tables (040), separate
-// route, no shared state between the two sources. Both happen to
-// target the same `abandoned_cart` template row.
+// provider, different payload shape, no shared state between the two
+// sources. Deliberately NOT wired into shopify_stores /
+// shopify_webhook_events / shopify_scheduled_notifications — separate
+// tables (040), separate route. Both happen to target the same
+// `abandoned_cart` template row.
+//
+// Authentication: NOT HMAC-signed. Confirmed against Razorpay's docs
+// that the Magic Checkout abandoned-cart webhook — unlike Razorpay's
+// general payment webhooks (X-Razorpay-Signature) — carries no
+// signature or secret of its own; there's nothing to verify a request
+// against. So this route relies on a shared secret WE generate and
+// register into the URL ourselves: a random token stored in
+// `razorpay_stores.webhook_secret` (plaintext — see the storage note
+// on that column, migration 040) that the registered webhook URL
+// carries as `?key=`. A request with a missing or wrong `key` is
+// rejected before any processing. This is weaker than HMAC (a leaked
+// URL — e.g. captured in a proxy/CDN access log that logs full
+// request URLs by default, which Vercel's own request log does — is
+// enough to forge requests, whereas HMAC additionally requires
+// tampering detection per-payload) but it's the only mechanism
+// available here; there's no signature to fall back to.
 //
 // Send timing (confirmed in chat): Razorpay's own abandonment delay
 // has already elapsed by the time this webhook fires — the cart is
@@ -23,22 +39,22 @@
 // it wasn't confirmed as needed.
 //
 // Flow per delivery:
-//   1. Read the raw body (needed byte-for-byte for HMAC verification).
-//   2. Parse it to read `shop_id` — Razorpay has no shop-identifying
-//      *header* the way Shopify sends X-Shopify-Shop-Domain, so the
-//      routing key has to come from the body itself. shop_id isn't a
-//      secret (Razorpay sends it, same self-identifying status as
-//      Shopify's shop_domain), so looking a store up by it before
-//      signature verification carries no oracle risk.
-//   3. Verify `X-Razorpay-Signature` (hex HMAC-SHA256, no prefix —
-//      see lib/razorpay/webhook-signature.ts) against that store's
-//      secret, over the raw body text.
-//   4. Dedupe on `x-razorpay-event-id` (Razorpay's docs: "unique per
+//   1. Read the raw body and parse it to read `shop_id` — Razorpay
+//      has no shop-identifying *header* the way Shopify sends
+//      X-Shopify-Shop-Domain, so the routing key has to come from the
+//      body itself. shop_id isn't a secret (Razorpay sends it, same
+//      self-identifying status as Shopify's shop_domain), so looking
+//      a store up by it before checking `?key=` carries no oracle
+//      risk.
+//   2. Check the `key` query param against that store's
+//      `webhook_secret`, exact match, timing-safe. Reject (401) if
+//      missing or wrong.
+//   3. Dedupe on `x-razorpay-event-id` (Razorpay's docs: "unique per
 //      event" — redelivery behavior isn't documented as explicitly as
 //      Shopify's, so this dedupes defensively regardless).
-//   5. Ack 200 immediately; do the actual mapping + send in `after()`
+//   4. Ack 200 immediately; do the actual mapping + send in `after()`
 //      so Razorpay's delivery timeout never turns into a retry storm.
-//   6. Record the outcome back onto the dedupe row (`sent` / `skipped`
+//   5. Record the outcome back onto the dedupe row (`sent` / `skipped`
 //      / `failed` + a reason) — mirrors shopify_webhook_events as the
 //      "why didn't this message go out" log.
 //
@@ -57,12 +73,11 @@
 //     or blocking the integration on it.
 // ============================================================
 
+import { timingSafeEqual } from 'node:crypto'
 import { NextResponse, after } from 'next/server'
 import type { SupabaseClient } from '@supabase/supabase-js'
 
 import { supabaseAdmin } from '@/lib/flows/admin-client'
-import { decrypt } from '@/lib/whatsapp/encryption'
-import { verifyRazorpayWebhookSignature } from '@/lib/razorpay/webhook-signature'
 import { normalizeRazorpayPhone } from '@/lib/razorpay/phone-normalize'
 import { isUniqueViolation } from '@/lib/contacts/dedupe'
 import { resolveConversationByPhone } from '@/lib/whatsapp/resolve-conversation'
@@ -109,7 +124,7 @@ interface RazorpayAbandonedCartPayload {
 
 export async function POST(request: Request) {
   const rawBody = await request.text()
-  const signature = request.headers.get('x-razorpay-signature')
+  const providedKey = new URL(request.url).searchParams.get('key')
   const eventId = request.headers.get('x-razorpay-event-id')
 
   if (!eventId) {
@@ -130,28 +145,16 @@ export async function POST(request: Request) {
 
   const db = supabaseAdmin()
 
-  // Store lookup must happen before signature verification — the
-  // secret is per-shop, and shop_id is self-identifying (Razorpay
-  // sends it, not a secret), so there's no oracle risk in a 404 here.
-  // Same reasoning as the Shopify route's shop_domain lookup — see
-  // its header comment.
+  // Store lookup must happen before the key check — the key is
+  // per-shop, and shop_id is self-identifying (Razorpay sends it, not
+  // a secret), so there's no oracle risk in a 404 here. Same reasoning
+  // as the Shopify route's shop_domain lookup — see its header
+  // comment.
   const { data: store, error: storeErr } = await db
     .from('razorpay_stores')
     .select('account_id, webhook_secret')
     .eq('shop_id', shopId)
     .maybeSingle()
-
-  // TEMP DEBUG — remove once the shop_id mismatch is found (see chat).
-  // JSON.stringify + length + hex reveal whitespace/casing/encoding
-  // differences that a plain console.log of the string would hide.
-  console.log('[razorpay-webhook][debug] shop_id lookup', {
-    payloadShopId: shopId,
-    payloadShopIdJSON: JSON.stringify(shopId),
-    payloadShopIdLength: shopId.length,
-    payloadShopIdHex: Buffer.from(shopId, 'utf8').toString('hex'),
-    store,
-    storeErr,
-  })
 
   if (storeErr) {
     console.error('[razorpay-webhook] store lookup failed:', storeErr.message)
@@ -162,10 +165,30 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Unknown shop' }, { status: 404 })
   }
 
-  const secret = decrypt(store.webhook_secret)
-  if (!verifyRazorpayWebhookSignature(rawBody, signature, secret)) {
-    console.warn('[razorpay-webhook] rejected request with invalid signature', { shopId })
-    return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
+  // Shared-secret check — see the "Authentication" note in the header
+  // comment for why this isn't HMAC. `webhook_secret` is stored
+  // plaintext (not `encrypt()`'d — deliberate, see chat); the guard
+  // below is length-then-timingSafeEqual, not `===`, for the same
+  // reason the cron routes compare their shared secret this way
+  // (avoid leaking a byte-by-byte timing oracle on the comparison).
+  const expectedKey = store.webhook_secret as string
+  // Fail closed on an unprovisioned secret — without this, an empty
+  // `webhook_secret` and a missing `?key=` would both produce a
+  // zero-length buffer, and the length check below would call that a
+  // match before timingSafeEqual ever runs. Same fail-closed posture
+  // as verifyMetaWebhookSignature's missing-secret guard.
+  if (!expectedKey) {
+    console.error('[razorpay-webhook] store has no webhook_secret configured', { shopId })
+    return NextResponse.json({ error: 'Internal error' }, { status: 500 })
+  }
+  const providedKeyBuf = Buffer.from(providedKey ?? '')
+  const expectedKeyBuf = Buffer.from(expectedKey)
+  if (
+    providedKeyBuf.length !== expectedKeyBuf.length ||
+    !timingSafeEqual(providedKeyBuf, expectedKeyBuf)
+  ) {
+    console.warn('[razorpay-webhook] rejected request with missing/wrong key', { shopId })
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
   // Dedupe — insert-first (not select-then-insert) so two concurrent

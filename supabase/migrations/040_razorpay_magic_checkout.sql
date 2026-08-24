@@ -4,23 +4,20 @@
 --
 -- A second, independent abandoned-cart *source* alongside Shopify's
 -- (`shopify_stores` / `shopify_webhook_events`, 037) — different
--- provider, different payload shape, different signature scheme
--- (X-Razorpay-Signature, HMAC-SHA256 **hex**, no prefix — see
--- lib/razorpay/webhook-signature.ts). Both sources target the same
--- `abandoned_cart` template; they don't share rows or scheduling
--- state with each other.
+-- provider, different payload shape, no shared rows or scheduling
+-- state with Shopify's tables. Both sources target the same
+-- `abandoned_cart` template.
 --
 -- Two tables, mirroring 037's shape exactly:
 --
 --   razorpay_stores — maps a Razorpay Magic Checkout store to the
 --   wacrm account that should receive its abandoned-cart events, and
---   holds the per-store webhook signing secret. Keyed on `shop_id`
---   (the `shop_id` field Razorpay includes in the webhook BODY, e.g.
+--   holds the per-store shared secret. Keyed on `shop_id` (the
+--   `shop_id` field Razorpay includes in the webhook BODY, e.g.
 --   "magic-checkout-test-store-1" — there's no shop-identifying
 --   *header* the way Shopify sends `X-Shopify-Shop-Domain`, so the
---   webhook route parses the JSON body first to read `shop_id`, looks
---   up the store by it, then verifies the signature against the raw
---   body text using that store's secret).
+--   webhook route parses the JSON body first to read `shop_id`, then
+--   looks up the store by it).
 --
 --   razorpay_webhook_events — dedupe + outcome log for inbound
 --   deliveries, keyed on Razorpay's `x-razorpay-event-id` header
@@ -29,12 +26,25 @@
 --   this dedupes defensively the same way regardless).
 --
 -- Design notes
---   - `razorpay_stores.webhook_secret` is AES-256-GCM-encrypted at
---     rest via the same `encrypt()`/`decrypt()` helpers as
---     `whatsapp_config.access_token`, `webhook_endpoints.secret`, and
---     `shopify_stores.webhook_secret` — same reasoning: we need the
---     plaintext at verification time to recompute the HMAC, so
---     hashing isn't an option.
+--   - `razorpay_stores.webhook_secret` is stored PLAINTEXT — NOT
+--     `encrypt()`'d, unlike every other secret column in this schema
+--     (`whatsapp_config.access_token`, `webhook_endpoints.secret`,
+--     `shopify_stores.webhook_secret`). This is deliberate (confirmed
+--     in chat) but flagged as a disagreement at the time: it's the
+--     same class of secret as `webhook_endpoints.secret` (an
+--     app-generated random token, not a third-party key) and that one
+--     IS encrypted, so the "opaque token vs real key" distinction
+--     doesn't hold up against this codebase's own precedent. Revisit
+--     if this table's threat model changes.
+--   - Unlike Shopify (HMAC over the raw body via a per-shop signing
+--     secret), Razorpay's Magic Checkout abandoned-cart webhook signs
+--     nothing — confirmed against Razorpay's docs, no signature or
+--     secret mechanism exists for this specific webhook (their
+--     general payment webhooks do sign, via X-Razorpay-Signature; this
+--     feature doesn't). So `webhook_secret` here isn't a signing key
+--     at all — it's a shared token WE generate, and the registered
+--     webhook URL carries it as `?key=`; the route does an exact
+--     timing-safe compare, not HMAC verification.
 --   - `shop_id` is UNIQUE — mirrors `shopify_stores.shop_domain`.
 --     Whether one wacrm account ever needs more than one Razorpay
 --     store row is unconfirmed (Magic Checkout's dashboard setup
@@ -60,7 +70,7 @@ CREATE TABLE IF NOT EXISTS razorpay_stores (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id     uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   shop_id        text NOT NULL UNIQUE,   -- Razorpay's `shop_id` field in the webhook body
-  webhook_secret text NOT NULL,          -- AES-256-GCM-encrypted (encrypt()/decrypt())
+  webhook_secret text NOT NULL,          -- plaintext shared token — see Design notes above
   created_at     timestamptz NOT NULL DEFAULT now()
 );
 
