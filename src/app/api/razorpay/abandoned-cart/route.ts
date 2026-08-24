@@ -183,50 +183,40 @@ export async function POST(request: Request) {
   }
   const providedKeyBuf = Buffer.from(providedKey ?? '')
   const expectedKeyBuf = Buffer.from(expectedKey)
-  const lengthsMatch = providedKeyBuf.length === expectedKeyBuf.length
-  // timingSafeEqual throws on length mismatch, so it's only safe to
-  // call when lengthsMatch — same guard the real check below uses via
-  // short-circuit; computed once here so the logged result and the
-  // actual branch decision can't drift apart.
-  const timingSafeEqualResult = lengthsMatch
-    ? timingSafeEqual(providedKeyBuf, expectedKeyBuf)
-    : false
-
-  // TEMP DEBUG — remove once the key mismatch is resolved (see chat).
-  // Logs the full secret value (both sides) — deliberate, that's what
-  // this comparison is over — so pull this out promptly once resolved
-  // rather than leaving it running.
-  console.log('[razorpay-webhook][debug] key check', {
-    requestUrl: request.url,
-    providedKey,
-    providedKeyJSON: JSON.stringify(providedKey),
-    providedKeyLength: providedKeyBuf.length,
-    providedKeyHex: providedKeyBuf.toString('hex'),
-    expectedKey,
-    expectedKeyJSON: JSON.stringify(expectedKey),
-    expectedKeyLength: expectedKeyBuf.length,
-    expectedKeyHex: expectedKeyBuf.toString('hex'),
-    lengthsMatch,
-    timingSafeEqualResult,
-  })
-
-  if (!lengthsMatch || !timingSafeEqualResult) {
+  if (
+    providedKeyBuf.length !== expectedKeyBuf.length ||
+    !timingSafeEqual(providedKeyBuf, expectedKeyBuf)
+  ) {
     console.warn('[razorpay-webhook] rejected request with missing/wrong key', { shopId })
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
+  // (Key-check TEMP DEBUG from the earlier "missing/wrong key" 401
+  // removed — confirmed resolved: reaching here means the check above
+  // already passed. It also logged `requestUrl`, which legitimately
+  // contains `?key=<hex>` — the likely source of the `?key=...` tail
+  // that showed up glued onto `cartToken` below; that log was the one
+  // adjacent line in the stream actually containing that substring.)
 
   // TEMP DEBUG — remove once we've captured one real payload and
   // confirmed which field (token vs cart_token) Razorpay's own
   // magic_order_id recovery links actually use (see the "Known gap"
   // note in the header comment). Logged post-auth only — this route
-  // is otherwise unauthenticated up to this point, so logging
-  // payload contents before the key check would let a spoofed request
-  // pollute the logs.
+  // is otherwise unauthenticated up to this point, so logging payload
+  // contents before the key check would let a spoofed request pollute
+  // the logs. JSON.stringify + length on each field, same as the
+  // earlier shop_id/key investigations, so a reader doesn't have to
+  // eyeball raw values to rule out a hidden/trailing-character issue
+  // (or, this time, confirm there's no stray `?key=...` actually
+  // inside the JSON value itself, as opposed to an adjacent log line).
   console.log('[razorpay-webhook][debug] captured payload', {
     shopId,
     eventId,
     token: payload.token,
+    tokenJSON: JSON.stringify(payload.token),
+    tokenLength: payload.token?.length ?? null,
     cartToken: payload.cart_token,
+    cartTokenJSON: JSON.stringify(payload.cart_token),
+    cartTokenLength: payload.cart_token?.length ?? null,
   })
 
   // Dedupe — insert-first (not select-then-insert) so two concurrent
