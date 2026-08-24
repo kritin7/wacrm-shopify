@@ -191,6 +191,20 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
+  // TEMP DEBUG — remove once we've captured one real payload and
+  // confirmed which field (token vs cart_token) Razorpay's own
+  // magic_order_id recovery links actually use (see the "Known gap"
+  // note in the header comment). Logged post-auth only — this route
+  // is otherwise unauthenticated up to this point, so logging
+  // payload contents before the key check would let a spoofed request
+  // pollute the logs.
+  console.log('[razorpay-webhook][debug] captured payload', {
+    shopId,
+    eventId,
+    token: payload.token,
+    cartToken: payload.cart_token,
+  })
+
   // Dedupe — insert-first (not select-then-insert) so two concurrent
   // deliveries of the same event id can't both pass a check and both
   // send. A unique-violation IS the duplicate signal.
