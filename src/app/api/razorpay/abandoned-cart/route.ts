@@ -198,25 +198,28 @@ export async function POST(request: Request) {
   // adjacent line in the stream actually containing that substring.)
 
   // TEMP DEBUG — remove once we've captured one real payload and
-  // confirmed which field (token vs cart_token) Razorpay's own
-  // magic_order_id recovery links actually use (see the "Known gap"
-  // note in the header comment). Logged post-auth only — this route
-  // is otherwise unauthenticated up to this point, so logging payload
-  // contents before the key check would let a spoofed request pollute
-  // the logs. JSON.stringify + length on each field, same as the
-  // earlier shop_id/key investigations, so a reader doesn't have to
-  // eyeball raw values to rule out a hidden/trailing-character issue
-  // (or, this time, confirm there's no stray `?key=...` actually
-  // inside the JSON value itself, as opposed to an adjacent log line).
-  console.log('[razorpay-webhook][debug] captured payload', {
+  // confirmed which field (token vs cart_token vs eventId) Razorpay's
+  // own magic_order_id recovery links actually use (see the "Known
+  // gap" note in the header comment). Logged post-auth only — this
+  // route is otherwise unauthenticated up to this point, so logging
+  // payload contents before the key check would let a spoofed request
+  // pollute the logs.
+  //
+  // `rawBody` — the exact, unparsed string Razorpay sent — not
+  // `payload` (the parsed object): console.log's default object
+  // inspection truncates nested structure past a couple of levels
+  // (line_items[], customer.Shipping_address, …), which would silently
+  // hide fields in a payload this size. The raw string has no such
+  // risk, at the cost of not being pretty-printed.
+  //
+  // NOTE: this now includes full payload contents — customer name,
+  // phone, email, shipping address, cart contents. Real PII, not just
+  // token/cart_token. Same as everything else in this block, pull it
+  // out once the field is confirmed rather than leaving it running.
+  console.log('[razorpay-webhook][debug] full captured payload', {
     shopId,
     eventId,
-    token: payload.token,
-    tokenJSON: JSON.stringify(payload.token),
-    tokenLength: payload.token?.length ?? null,
-    cartToken: payload.cart_token,
-    cartTokenJSON: JSON.stringify(payload.cart_token),
-    cartTokenLength: payload.cart_token?.length ?? null,
+    rawBody,
   })
 
   // Dedupe — insert-first (not select-then-insert) so two concurrent
