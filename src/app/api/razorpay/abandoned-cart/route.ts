@@ -141,6 +141,18 @@ export async function POST(request: Request) {
     .eq('shop_id', shopId)
     .maybeSingle()
 
+  // TEMP DEBUG — remove once the shop_id mismatch is found (see chat).
+  // JSON.stringify + length + hex reveal whitespace/casing/encoding
+  // differences that a plain console.log of the string would hide.
+  console.log('[razorpay-webhook][debug] shop_id lookup', {
+    payloadShopId: shopId,
+    payloadShopIdJSON: JSON.stringify(shopId),
+    payloadShopIdLength: shopId.length,
+    payloadShopIdHex: Buffer.from(shopId, 'utf8').toString('hex'),
+    store,
+    storeErr,
+  })
+
   if (storeErr) {
     console.error('[razorpay-webhook] store lookup failed:', storeErr.message)
     return NextResponse.json({ error: 'Internal error' }, { status: 500 })
