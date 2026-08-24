@@ -183,10 +183,34 @@ export async function POST(request: Request) {
   }
   const providedKeyBuf = Buffer.from(providedKey ?? '')
   const expectedKeyBuf = Buffer.from(expectedKey)
-  if (
-    providedKeyBuf.length !== expectedKeyBuf.length ||
-    !timingSafeEqual(providedKeyBuf, expectedKeyBuf)
-  ) {
+  const lengthsMatch = providedKeyBuf.length === expectedKeyBuf.length
+  // timingSafeEqual throws on length mismatch, so it's only safe to
+  // call when lengthsMatch — same guard the real check below uses via
+  // short-circuit; computed once here so the logged result and the
+  // actual branch decision can't drift apart.
+  const timingSafeEqualResult = lengthsMatch
+    ? timingSafeEqual(providedKeyBuf, expectedKeyBuf)
+    : false
+
+  // TEMP DEBUG — remove once the key mismatch is resolved (see chat).
+  // Logs the full secret value (both sides) — deliberate, that's what
+  // this comparison is over — so pull this out promptly once resolved
+  // rather than leaving it running.
+  console.log('[razorpay-webhook][debug] key check', {
+    requestUrl: request.url,
+    providedKey,
+    providedKeyJSON: JSON.stringify(providedKey),
+    providedKeyLength: providedKeyBuf.length,
+    providedKeyHex: providedKeyBuf.toString('hex'),
+    expectedKey,
+    expectedKeyJSON: JSON.stringify(expectedKey),
+    expectedKeyLength: expectedKeyBuf.length,
+    expectedKeyHex: expectedKeyBuf.toString('hex'),
+    lengthsMatch,
+    timingSafeEqualResult,
+  })
+
+  if (!lengthsMatch || !timingSafeEqualResult) {
     console.warn('[razorpay-webhook] rejected request with missing/wrong key', { shopId })
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
