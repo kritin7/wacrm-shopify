@@ -189,16 +189,6 @@ export async function POST(request: Request) {
 }
 
 // ------------------------------------------------------------
-// GET — temporary, for validating whether Razorpay's webhook-URL
-// save button does a GET check before accepting the field.
-// Safe to revert once confirmed/denied.
-// ------------------------------------------------------------
-
-export async function GET() {
-  return new NextResponse(null, { status: 200 })
-}
-
-// ------------------------------------------------------------
 // Processing
 // ------------------------------------------------------------
 
