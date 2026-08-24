@@ -58,19 +58,21 @@
 //      / `failed` + a reason) — mirrors shopify_webhook_events as the
 //      "why didn't this message go out" log.
 //
-// Known gap, deliberately left unresolved (flagged, not guessed):
-//   - abandoned_cart's URL button carries a positional {{1}} suffix
-//     (`.../cart?magic_order_id=order_{{1}}`) that this route does NOT
-//     populate. The abandoned-cart payload has two candidate fields —
-//     `token` (session token) and `cart_token` (cart identifier,
-//     "c1-..." prefixed) — and it's unconfirmed which one (if either)
-//     is what Razorpay's own magic_order_id recovery links actually
-//     use. Confirm against a real Razorpay-generated recovery URL
-//     before wiring `buttonParams`; sending the wrong id would produce
-//     a broken "Complete your Purchase" link. Same category of gap as
-//     the Shopify route's cod_followup discount-amount TODO — sends
-//     without it (body still goes out correctly) rather than guessing
-//     or blocking the integration on it.
+// Button {{1}} (confirmed, was previously the "Known gap" here):
+//   abandoned_cart's URL button carries a positional {{1}} suffix
+//   (`.../cart?magic_order_id=order_{{1}}`), which Meta REQUIRES a
+//   value for on every send — `buildButtonComponent` throws
+//   unconditionally when a URL button needs {{1}} and no override is
+//   given (see template-send-builder.ts), so until this was wired,
+//   every send from this route failed at that throw (check
+//   razorpay_webhook_events for `status = 'failed'` rows with that
+//   message if that's news). The id comes from
+//   `payload.abandoned_checkout_url`'s own `magic_order_id=order_<id>`
+//   query param — Razorpay hands back the exact recovery URL, so the
+//   {{1}} value is extracted from it via `new URL(...).searchParams`,
+//   not string-split (Razorpay controls that URL's shape; the
+//   `token`/`cart_token` fields this comment used to flag as
+//   candidates were the wrong place to look).
 // ============================================================
 
 import { timingSafeEqual } from 'node:crypto'
@@ -109,13 +111,49 @@ interface RazorpayCustomer {
 
 interface RazorpayAbandonedCartPayload {
   shop_id?: string | null
-  /** Session token — one of two candidates for the button's {{1}}; unconfirmed which. */
-  token?: string | null
-  /** Cart identifier ("c1-..." prefixed) — the other candidate; unconfirmed which. */
-  cart_token?: string | null
+  /**
+   * Recovery URL Razorpay sends the customer, e.g.
+   * ".../cart?magic_order_id=order_TTiDpyfhajMwh6" — the source for
+   * the abandoned_cart template's URL button {{1}} (see
+   * `extractMagicOrderId`).
+   */
+  abandoned_checkout_url?: string | null
   /** Already E.164-formatted per Razorpay's sample ("+919999999999"). */
   phone?: string | null
   customer?: RazorpayCustomer | null
+}
+
+/**
+ * Pull the order id out of `abandoned_checkout_url`'s `magic_order_id`
+ * query param — `.../cart?magic_order_id=order_TTiDpyfhajMwh6` →
+ * `"TTiDpyfhajMwh6"` — which is exactly the value the abandoned_cart
+ * template's button needs for its {{1}} (the template's URL is
+ * `.../cart?magic_order_id=order_{{1}}`, so only the suffix after
+ * `order_` gets substituted in).
+ *
+ * Parsed via `URL`/`searchParams`, not a string split — Razorpay
+ * controls this URL's exact shape (query param order, encoding,
+ * extra params), and `URLSearchParams` handles all of that correctly
+ * where a split on a literal substring wouldn't.
+ *
+ * Returns `undefined` — never throws — on a missing/malformed URL or
+ * a `magic_order_id` that isn't `order_`-prefixed, so callers can
+ * treat "couldn't extract" as "no override" and let
+ * `buildButtonComponent`'s own throw (a template send genuinely
+ * cannot go out without this) surface a specific reason rather than
+ * this function guessing or crashing the whole `after()` block.
+ */
+function extractMagicOrderId(
+  abandonedCheckoutUrl: string | null | undefined,
+): string | undefined {
+  if (!abandonedCheckoutUrl) return undefined
+  let magicOrderId: string | null
+  try {
+    magicOrderId = new URL(abandonedCheckoutUrl).searchParams.get('magic_order_id')
+  } catch {
+    return undefined
+  }
+  return magicOrderId?.replace(/^order_/, '') || undefined
 }
 
 // ------------------------------------------------------------
@@ -190,37 +228,9 @@ export async function POST(request: Request) {
     console.warn('[razorpay-webhook] rejected request with missing/wrong key', { shopId })
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-  // (Key-check TEMP DEBUG from the earlier "missing/wrong key" 401
-  // removed — confirmed resolved: reaching here means the check above
-  // already passed. It also logged `requestUrl`, which legitimately
-  // contains `?key=<hex>` — the likely source of the `?key=...` tail
-  // that showed up glued onto `cartToken` below; that log was the one
-  // adjacent line in the stream actually containing that substring.)
-
-  // TEMP DEBUG — remove once we've captured one real payload and
-  // confirmed which field (token vs cart_token vs eventId) Razorpay's
-  // own magic_order_id recovery links actually use (see the "Known
-  // gap" note in the header comment). Logged post-auth only — this
-  // route is otherwise unauthenticated up to this point, so logging
-  // payload contents before the key check would let a spoofed request
-  // pollute the logs.
-  //
-  // `rawBody` — the exact, unparsed string Razorpay sent — not
-  // `payload` (the parsed object): console.log's default object
-  // inspection truncates nested structure past a couple of levels
-  // (line_items[], customer.Shipping_address, …), which would silently
-  // hide fields in a payload this size. The raw string has no such
-  // risk, at the cost of not being pretty-printed.
-  //
-  // NOTE: this now includes full payload contents — customer name,
-  // phone, email, shipping address, cart contents. Real PII, not just
-  // token/cart_token. Same as everything else in this block, pull it
-  // out once the field is confirmed rather than leaving it running.
-  console.log('[razorpay-webhook][debug] full captured payload', {
-    shopId,
-    eventId,
-    rawBody,
-  })
+  // (TEMP DEBUG blocks from the shop_id / key / payload-shape
+  // investigations all removed — confirmed resolved. See chat history
+  // if any of that context is needed again.)
 
   // Dedupe — insert-first (not select-then-insert) so two concurrent
   // deliveries of the same event id can't both pass a check and both
@@ -280,6 +290,7 @@ async function processEvent(args: {
   const last = payload.customer?.last_name ?? ''
   const contactName = [first, last].filter(Boolean).join(' ').trim() || null
   const firstName = payload.customer?.first_name?.trim() || 'there'
+  const magicOrderId = extractMagicOrderId(payload.abandoned_checkout_url)
 
   try {
     const resolved = await resolveConversationByPhone(db, accountId, phone, contactName)
@@ -288,10 +299,15 @@ async function processEvent(args: {
       messageType: 'template',
       templateName: TEMPLATE_NAME,
       templateLanguage: LANGUAGE,
-      // abandoned_cart: { first_name } — NAMED. The button's {{1}}
-      // (magic_order_id) is intentionally NOT populated here — see
-      // the route header comment on the token/cart_token gap.
-      templateMessageParams: { body: { first_name: firstName } },
+      // abandoned_cart: { first_name } — NAMED. Button {{1}} — see
+      // extractMagicOrderId. Omitted (not sent as an empty string)
+      // when extraction fails, so buildButtonComponent's own throw
+      // ("requires a buttonParams[0] value") surfaces instead of a
+      // broken link going out silently.
+      templateMessageParams: {
+        body: { first_name: firstName },
+        ...(magicOrderId ? { buttonParams: { 0: magicOrderId } } : {}),
+      },
     })
     await markEvent(db, eventId, 'sent', `${TEMPLATE_NAME} (${result.whatsappMessageId})`)
   } catch (err) {
