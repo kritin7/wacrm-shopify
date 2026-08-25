@@ -29,15 +29,15 @@
 //   orders/create        → order_placed_prepaid / order_placed_cod
 //   orders/cancelled     → order_cancelled
 //   fulfillments/create  → shipped
-//   fulfillments/update  → order_delivered (shipment_status=delivered)
-//                           out_for_delivery_* currently SKIPPED — see
-//                           the out_for_delivery note below.
+//   fulfillments/update  → order_delivered (shipment_status=delivered);
+//                           out_for_delivery_prepaid / out_for_delivery_cod
+//                           (shipment_status=out_for_delivery), via
+//                           shopify_order_cache — see below.
 //                           missing/unset shipment_status and any other
-//                           unmapped value are also SKIPPED, each with
-//                           its own distinct reason (see
-//                           handleFulfillmentUpdate).
-//   refunds/create        → refund_prepaid, currently SKIPPED — see the
-//                            refunds/create note below.
+//                           unmapped value are SKIPPED, each with its
+//                           own distinct reason (see handleFulfillmentUpdate).
+//   refunds/create        → refund_prepaid, via shopify_order_cache —
+//                            see below.
 //
 // Topics handled via the deferred-send queue (`shopify_scheduled_notifications`,
 // drained by `/api/cron/shopify-notifications`) because they aren't a
@@ -47,20 +47,25 @@
 //   (orders/create, when COD) → schedules cod_followup, cancelled if
 //                       the same order_id gets a fulfillments/create.
 //
+// shopify_order_cache (migration 041): neither the Fulfillment payload
+// (fulfillments/update) nor the Refund payload (refunds/create) carries
+// enough to build their templates on their own — confirmed against
+// Shopify's Fulfillment REST resource docs that it has no
+// financial_status/gateway/payment_gateway_names at all (it's a
+// shipping resource, not a payment one), and the Refund payload has no
+// customer/shipping_address/phone whatsoever. Rather than an external
+// Admin API lookup per event, `handleOrderCreate` snapshots what these
+// two handlers need into `shopify_order_cache` once, at order creation.
+// A miss (order predates the cache, or its orders/create webhook
+// failed/was missed) means both handlers still skip-and-log rather
+// than guessing prepaid/cod or fabricating contact info — see
+// `getOrderCache` and its call sites.
+//
 // Known gaps, deliberately left unresolved (confirmed in chat):
-//   - out_for_delivery_prepaid vs out_for_delivery_cod: confirmed
-//     against Shopify's Fulfillment REST resource docs — the
-//     fulfillments/update payload carries no financial_status/gateway/
-//     payment_gateway_names, only order_id; it's a shipping resource,
-//     not a payment one. Resolving this (a local order→payment-kind
-//     cache, or an Admin API refetch) is not built — `handleFulfillmentUpdate`
-//     always skips out_for_delivery with that reason rather than
-//     forcing `guessIsPrepaid` through a payload it can't actually
-//     read (which would silently default to "prepaid" every time).
-//   - refunds/create: the Refund payload carries only `order_id`, no
-//     customer/shipping_address/phone at all. Same category of gap as
-//     above (needs an order_id → contact lookup); `handleRefundCreate`
-//     always skips with a clear reason rather than guessing or crashing.
+//   - refund_prepaid is sent regardless of the cached is_prepaid flag
+//     — it's the only refund template in this catalog; there's no
+//     refund_cod counterpart for a COD order's refund. Flagged in
+//     handleRefundCreate, not resolved.
 //   - Template body variable order ({{1}}, {{2}}, …) below is a
 //     best-effort guess per template — confirm against your actual
 //     approved templates before relying on this in production.
@@ -281,7 +286,7 @@ async function processEvent(args: {
     case 'orders/cancelled':
       return handleOrderCancelled(db, accountId, webhookId, payload as ShopifyOrderPayload)
     case 'refunds/create':
-      return handleRefundCreate(db, webhookId, payload as ShopifyRefundPayload)
+      return handleRefundCreate(db, accountId, webhookId, payload as ShopifyRefundPayload)
     case 'fulfillments/create':
       return handleFulfillmentCreate(db, accountId, webhookId, payload as ShopifyFulfillmentPayload)
     case 'fulfillments/update':
@@ -305,6 +310,31 @@ async function handleOrderCreate(
   const orderNumber = order.name ?? String(order.id)
   const firstName = recipient.contactName?.split(' ')[0] || 'there'
   const amount = formatOrderAmount(order.total_price)
+  const normalizedPhone = normalizeShopifyPhone(recipient.rawPhone, recipient.countryAlpha2)
+
+  // Cache order facts fulfillments/update (out_for_delivery) and
+  // refunds/create need later — neither payload carries payment info,
+  // and refunds/create carries no contact info at all. Re-fetching
+  // from Shopify's Admin API per event was the alternative; this is a
+  // one-time local snapshot instead. See migration 041 for the full
+  // rationale (including why it's fine for this to go stale and why
+  // there's no cleanup/expiry). Best-effort: a failure here doesn't
+  // block the primary send below, and a duplicate orders/create-shaped
+  // redelivery (Shopify's own redelivery quirks — see the file header
+  // comment) is a no-op via the unique violation on order_id.
+  const { error: cacheErr } = await db.from('shopify_order_cache').insert({
+    account_id: accountId,
+    shop_domain: shopDomain,
+    order_id: String(order.id),
+    order_name: orderNumber,
+    order_amount: amount,
+    is_prepaid: isPrepaid,
+    customer_first_name: firstName,
+    customer_phone: normalizedPhone,
+  })
+  if (cacheErr && !isUniqueViolation(cacheErr)) {
+    console.error('[shopify-webhook] failed to cache order data:', cacheErr.message)
+  }
 
   // order_placed_prepaid: { first_name, order_number, prepaid_order_amount }
   // order_placed_cod:     { first_name, order_number, cod_order_amount }
@@ -334,7 +364,7 @@ async function handleOrderCreate(
   // COD orders get a delayed follow-up nudge, cancelled if the order
   // ships before it fires (see handleFulfillmentCreate).
   if (!isPrepaid) {
-    const phone = normalizeShopifyPhone(recipient.rawPhone, recipient.countryAlpha2)
+    const phone = normalizedPhone
     if (phone) {
       const { error } = await db.from('shopify_scheduled_notifications').insert({
         account_id: accountId,
@@ -382,20 +412,52 @@ async function handleOrderCancelled(
 
 async function handleRefundCreate(
   db: SupabaseClient,
+  accountId: string,
   webhookId: string,
   refund: ShopifyRefundPayload,
 ): Promise<void> {
   // Shopify's Refund payload carries `order_id` only — no customer,
-  // shipping_address, or phone. Sending refund_prepaid needs an
-  // order_id → contact lookup this route doesn't have (same category
-  // of gap as out_for_delivery's payment-kind lookup, deferred in
-  // chat) — skip with a specific reason rather than guessing.
-  await markEvent(
-    db,
-    webhookId,
-    'skipped',
-    `refunds/create: no contact info in payload for order ${refund.order_id} — order_id→phone lookup not wired`,
-  )
+  // shipping_address, or phone at all. Now unblocked via
+  // shopify_order_cache (migration 041), populated by handleOrderCreate
+  // at orders/create time. A miss (order predates the cache, or its
+  // orders/create webhook failed/was missed) means there's still no
+  // contact info to send to — skip rather than guess, same as before
+  // the cache existed, just with a more specific reason.
+  const cached = await getOrderCache(db, refund.order_id)
+  if (!cached) {
+    await markEvent(
+      db,
+      webhookId,
+      'skipped',
+      `refunds/create: no shopify_order_cache row for order ${refund.order_id} — refunds/create payload carries no contact info of its own`,
+    )
+    return
+  }
+
+  const recipient: Recipient = {
+    rawPhone: cached.customer_phone,
+    countryAlpha2: null,
+    contactName: cached.customer_first_name,
+  }
+
+  // refund_prepaid: { first_name, order_number, prepaid_order_amount }
+  // NOTE: sends regardless of cached.is_prepaid — refund_prepaid is
+  // the only refund template that exists in this catalog; there's no
+  // refund_cod counterpart to send instead for a COD order's refund.
+  // Flagged, not resolved: confirm whether COD refunds need their own
+  // template, or should skip instead of going out under "prepaid"
+  // copy that may not fit (e.g. "refunded to your original payment
+  // method" doesn't describe a COD order, where nothing was collected
+  // upfront to refund).
+  await sendTemplateAndMark(db, accountId, webhookId, recipient, {
+    templateName: 'refund_prepaid',
+    language: LANGUAGE,
+    body: {
+      first_name: cached.customer_first_name,
+      order_number: cached.order_name,
+      prepaid_order_amount: cached.order_amount,
+    },
+  })
 }
 
 async function handleFulfillmentCreate(
@@ -406,17 +468,24 @@ async function handleFulfillmentCreate(
 ): Promise<void> {
   const recipient = extractFulfillmentRecipient(fulfillment)
   const firstName = recipient.contactName?.split(' ')[0] || 'there'
+  const cached = await getOrderCache(db, fulfillment.order_id)
+  // order_number: prefer the cached order_name (the "#1234" display
+  // format) from orders/create; fall back to the raw numeric order_id
+  // on a cache miss (order placed before this cache existed, or its
+  // orders/create webhook failed/was missed) — same fallback this
+  // handler always used before the cache existed. Unlike the
+  // out_for_delivery / refund_prepaid branches elsewhere in this file,
+  // a miss here doesn't block the send: `shipped` can go out correctly
+  // either way, it's the display format that degrades, not the
+  // decision of whether to send at all — so this isn't a guess.
+  const orderNumber = cached?.order_name ?? String(fulfillment.order_id)
   // shipped: { first_name, order_number, tracking_id }
-  // TODO: order_number falls back to the numeric order_id — the
-  // fulfillment webhook payload doesn't carry the order's display
-  // name (e.g. "#3432"), only order_id. Wire an order_id→name lookup
-  // if the exact display format matters.
   await sendTemplateAndMark(db, accountId, webhookId, recipient, {
     templateName: 'shipped',
     language: LANGUAGE,
     body: {
       first_name: firstName,
-      order_number: String(fulfillment.order_id),
+      order_number: orderNumber,
       tracking_id: fulfillment.tracking_number ?? '',
     },
   })
@@ -470,24 +539,52 @@ async function handleFulfillmentUpdate(
   }
 
   if (status === 'out_for_delivery') {
-    // Payment-kind resolution genuinely unavailable here, not just
-    // deferred: confirmed against Shopify's Fulfillment REST resource
-    // docs (shopify.dev/docs/api/admin-rest/latest/resources/fulfillment)
-    // that the object has no financial_status / gateway /
-    // payment_gateway_names field at all — it's a shipping resource,
-    // those only exist on the Order payload. guessIsPrepaid (built for
-    // ShopifyOrderPayload) can't be reused against this payload as-is;
-    // forcing it through would silently default to "prepaid" every
-    // time (financial_status undefined → guessIsPrepaid's ambiguous
-    // fallback), which is a wrong-guess, not a graceful one. Resolving
-    // this needs an order_id → payment-kind lookup (a local cache or
-    // an Admin API refetch) — not built here, skip rather than guess.
-    await markEvent(
-      db,
-      webhookId,
-      'skipped',
-      'out_for_delivery: prepaid/cod undetermined — Fulfillment payload has no financial_status/gateway (confirmed against Shopify docs); needs an order_id→payment-kind lookup, not built here',
-    )
+    // Payment-kind resolution: confirmed against Shopify's Fulfillment
+    // REST resource docs that the object has no financial_status /
+    // gateway / payment_gateway_names at all — it's a shipping
+    // resource, that data only exists on the Order payload. Now
+    // unblocked via shopify_order_cache (migration 041), populated by
+    // handleOrderCreate at orders/create time. A miss (order predates
+    // the cache, or its orders/create webhook failed/was missed) means
+    // there's still no way to pick prepaid vs cod without guessing —
+    // skip rather than default to one, same as before the cache
+    // existed, just with a more specific reason.
+    const cached = await getOrderCache(db, fulfillment.order_id)
+    if (!cached) {
+      await markEvent(
+        db,
+        webhookId,
+        'skipped',
+        'out_for_delivery: no shopify_order_cache row for this order_id — cannot determine prepaid/cod or the order amount',
+      )
+      return
+    }
+
+    const trackingId = fulfillment.tracking_number ?? ''
+    if (cached.is_prepaid) {
+      // out_for_delivery_prepaid: { first_name, order_number, tracking_id }
+      await sendTemplateAndMark(db, accountId, webhookId, recipient, {
+        templateName: 'out_for_delivery_prepaid',
+        language: LANGUAGE,
+        body: {
+          first_name: firstName,
+          order_number: cached.order_name,
+          tracking_id: trackingId,
+        },
+      })
+    } else {
+      // out_for_delivery_cod: { first_name, order_number, cod_amount, tracking_id }
+      await sendTemplateAndMark(db, accountId, webhookId, recipient, {
+        templateName: 'out_for_delivery_cod',
+        language: LANGUAGE,
+        body: {
+          first_name: firstName,
+          order_number: cached.order_name,
+          cod_amount: cached.order_amount,
+          tracking_id: trackingId,
+        },
+      })
+    }
     return
   }
 
@@ -609,6 +706,41 @@ async function sendTemplateAndMark(
     })
     await markEvent(db, webhookId, 'failed', message)
   }
+}
+
+// ------------------------------------------------------------
+// Order cache reads — see migration 041 for what's cached and why.
+// ------------------------------------------------------------
+
+interface OrderCacheRow {
+  order_name: string
+  order_amount: string
+  is_prepaid: boolean
+  customer_first_name: string
+  customer_phone: string | null
+}
+
+/**
+ * A lookup failure (transient DB error) is treated the same as a miss
+ * (`null`) by every call site — logged here so it's not silently
+ * swallowed, but callers can't act on "error vs genuinely no row"
+ * differently anyway; both mean "no order data available right now",
+ * same skip-and-log response either way.
+ */
+async function getOrderCache(
+  db: SupabaseClient,
+  orderId: number,
+): Promise<OrderCacheRow | null> {
+  const { data, error } = await db
+    .from('shopify_order_cache')
+    .select('order_name, order_amount, is_prepaid, customer_first_name, customer_phone')
+    .eq('order_id', String(orderId))
+    .maybeSingle()
+  if (error) {
+    console.error('[shopify-webhook] order cache lookup failed:', error.message)
+    return null
+  }
+  return data as OrderCacheRow | null
 }
 
 // ------------------------------------------------------------
