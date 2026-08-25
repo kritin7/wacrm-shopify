@@ -32,6 +32,10 @@
 //   fulfillments/update  → order_delivered (shipment_status=delivered)
 //                           out_for_delivery_* currently SKIPPED — see
 //                           the out_for_delivery note below.
+//                           missing/unset shipment_status and any other
+//                           unmapped value are also SKIPPED, each with
+//                           its own distinct reason (see
+//                           handleFulfillmentUpdate).
 //   refunds/create        → refund_prepaid, currently SKIPPED — see the
 //                            refunds/create note below.
 //
@@ -44,11 +48,15 @@
 //                       the same order_id gets a fulfillments/create.
 //
 // Known gaps, deliberately left unresolved (confirmed in chat):
-//   - out_for_delivery_prepaid vs out_for_delivery_cod: fulfillment
-//     payloads carry no payment info, only order_id. Resolving this
-//     (a local order→payment-kind cache, or an Admin API refetch) was
-//     explicitly deferred — `handleFulfillmentUpdate` always skips
-//     out_for_delivery rather than guessing.
+//   - out_for_delivery_prepaid vs out_for_delivery_cod: confirmed
+//     against Shopify's Fulfillment REST resource docs — the
+//     fulfillments/update payload carries no financial_status/gateway/
+//     payment_gateway_names, only order_id; it's a shipping resource,
+//     not a payment one. Resolving this (a local order→payment-kind
+//     cache, or an Admin API refetch) is not built — `handleFulfillmentUpdate`
+//     always skips out_for_delivery with that reason rather than
+//     forcing `guessIsPrepaid` through a payload it can't actually
+//     read (which would silently default to "prepaid" every time).
 //   - refunds/create: the Refund payload carries only `order_id`, no
 //     customer/shipping_address/phone at all. Same category of gap as
 //     above (needs an order_id → contact lookup); `handleRefundCreate`
@@ -433,8 +441,25 @@ async function handleFulfillmentUpdate(
 ): Promise<void> {
   const recipient = extractFulfillmentRecipient(fulfillment)
   const firstName = recipient.contactName?.split(' ')[0] || 'there'
+  const status = fulfillment.shipment_status
 
-  if (fulfillment.shipment_status === 'delivered') {
+  if (!status) {
+    // Distinct from "an explicit status we don't map" below — we
+    // don't yet know whether this store's carrier setup ever
+    // populates shipment_status on fulfillments/update at all, so
+    // call out "never reports this" separately from "reported
+    // something unmapped" rather than folding both into one generic
+    // reason.
+    await markEvent(
+      db,
+      webhookId,
+      'skipped',
+      'shipment_status not populated for this fulfillment',
+    )
+    return
+  }
+
+  if (status === 'delivered') {
     // order_delivered: { first_name }
     await sendTemplateAndMark(db, accountId, webhookId, recipient, {
       templateName: 'order_delivered',
@@ -444,15 +469,24 @@ async function handleFulfillmentUpdate(
     return
   }
 
-  if (fulfillment.shipment_status === 'out_for_delivery') {
-    // Payment-kind resolution deferred per your answer (fulfillment
-    // payloads carry no financial_status/gateway) — skip rather than
-    // guess prepaid vs cod.
+  if (status === 'out_for_delivery') {
+    // Payment-kind resolution genuinely unavailable here, not just
+    // deferred: confirmed against Shopify's Fulfillment REST resource
+    // docs (shopify.dev/docs/api/admin-rest/latest/resources/fulfillment)
+    // that the object has no financial_status / gateway /
+    // payment_gateway_names field at all — it's a shipping resource,
+    // those only exist on the Order payload. guessIsPrepaid (built for
+    // ShopifyOrderPayload) can't be reused against this payload as-is;
+    // forcing it through would silently default to "prepaid" every
+    // time (financial_status undefined → guessIsPrepaid's ambiguous
+    // fallback), which is a wrong-guess, not a graceful one. Resolving
+    // this needs an order_id → payment-kind lookup (a local cache or
+    // an Admin API refetch) — not built here, skip rather than guess.
     await markEvent(
       db,
       webhookId,
       'skipped',
-      'out_for_delivery: prepaid/cod detection deferred — see route.ts header comment',
+      'out_for_delivery: prepaid/cod undetermined — Fulfillment payload has no financial_status/gateway (confirmed against Shopify docs); needs an order_id→payment-kind lookup, not built here',
     )
     return
   }
@@ -463,7 +497,7 @@ async function handleFulfillmentUpdate(
     db,
     webhookId,
     'skipped',
-    `fulfillments/update: no template for shipment_status "${fulfillment.shipment_status ?? ''}"`,
+    `fulfillments/update: no template for shipment_status "${status}"`,
   )
 }
 
