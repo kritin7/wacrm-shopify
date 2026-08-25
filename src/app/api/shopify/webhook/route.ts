@@ -62,10 +62,12 @@
 // `getOrderCache` and its call sites.
 //
 // Known gaps, deliberately left unresolved (confirmed in chat):
-//   - refund_prepaid is sent regardless of the cached is_prepaid flag
-//     — it's the only refund template in this catalog; there's no
-//     refund_cod counterpart for a COD order's refund. Flagged in
-//     handleRefundCreate, not resolved.
+//   - refund_prepaid is the only refund template in this catalog —
+//     no refund_cod counterpart exists for a COD order's refund, so
+//     handleRefundCreate skips (cached.is_prepaid === false) rather
+//     than sending "refunded to your original payment method" copy
+//     that doesn't describe a COD order. Revisit if COD refunds turn
+//     out to be common enough to justify a new template.
 //   - Template body variable order ({{1}}, {{2}}, …) below is a
 //     best-effort guess per template — confirm against your actual
 //     approved templates before relying on this in production.
@@ -434,6 +436,22 @@ async function handleRefundCreate(
     return
   }
 
+  if (!cached.is_prepaid) {
+    // refund_prepaid is the only refund template in this catalog —
+    // there's no refund_cod counterpart, and its copy ("refunded to
+    // your original payment method") doesn't describe a COD order,
+    // where nothing was collected upfront to refund. Skip rather than
+    // send it anyway. Revisit if COD refunds turn out to be common
+    // enough to justify a new template.
+    await markEvent(
+      db,
+      webhookId,
+      'skipped',
+      'refund on COD order — no refund_cod template exists yet',
+    )
+    return
+  }
+
   const recipient: Recipient = {
     rawPhone: cached.customer_phone,
     countryAlpha2: null,
@@ -441,14 +459,6 @@ async function handleRefundCreate(
   }
 
   // refund_prepaid: { first_name, order_number, prepaid_order_amount }
-  // NOTE: sends regardless of cached.is_prepaid — refund_prepaid is
-  // the only refund template that exists in this catalog; there's no
-  // refund_cod counterpart to send instead for a COD order's refund.
-  // Flagged, not resolved: confirm whether COD refunds need their own
-  // template, or should skip instead of going out under "prepaid"
-  // copy that may not fit (e.g. "refunded to your original payment
-  // method" doesn't describe a COD order, where nothing was collected
-  // upfront to refund).
   await sendTemplateAndMark(db, accountId, webhookId, recipient, {
     templateName: 'refund_prepaid',
     language: LANGUAGE,
